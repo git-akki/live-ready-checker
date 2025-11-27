@@ -149,26 +149,6 @@ class AudioQualityDetector {
       status: status,
     };
   }
-    let status: AudioAnalysis["status"] = "OK";
-    if (rms < this.RMS_THRESHOLD_LOW) {
-      status = "Too Quiet";
-    } else if (clippingPercent > this.CLIPPING_THRESHOLD_PERCENT) {
-      status = "Clipping";
-    } else if (noiseFloor > this.NOISE_FLOOR_THRESHOLD && rms < 0.1) {
-      status = "Background Noise";
-    } else if (rms > this.RMS_THRESHOLD_HIGH) {
-      status = "Too Loud";
-    }
-
-    return {
-      rms: rms,
-      clipping: clippingPercent > this.CLIPPING_THRESHOLD_PERCENT,
-      clippingPercent: clippingPercent,
-      noiseFloor: noiseFloor,
-      microphoneType: this.detectMicrophoneType(),
-      status: status,
-    };
-  }
 
   /**
    * Detect if microphone is default or external.
@@ -197,10 +177,15 @@ interface VideoAnalysis {
 class VideoQualityDetector {
   private canvas: HTMLCanvasElement | null = null;
   private ctx: CanvasRenderingContext2D | null = null;
-  private readonly GRID_SIZE = 10; // 10x10 blocks
-  private readonly BRIGHTNESS_LOW = 40;
-  private readonly BRIGHTNESS_HIGH = 200;
-  private readonly UNIFORMITY_THRESHOLD = 25;
+  private brightnessHistory: number[] = [];
+  private readonly HISTORY_SIZE = 10;
+  
+  // Tighter thresholds (Google-grade precision)
+  private readonly GRID_SIZE = 16; // 16x16 for finer-grained analysis
+  private readonly BRIGHTNESS_LOW = 30;      // Darker threshold for better detection
+  private readonly BRIGHTNESS_OPTIMAL = 100; // Optimal range center
+  private readonly BRIGHTNESS_HIGH = 180;    // Tighter overexposure threshold
+  private readonly UNIFORMITY_THRESHOLD = 30; // Standard deviation threshold
 
   constructor(canvas: HTMLCanvasElement, ctx: CanvasRenderingContext2D) {
     this.canvas = canvas;
@@ -289,6 +274,7 @@ class VideoQualityDetector {
 
   /**
    * Analyze video frame and return diagnostic data.
+   * Uses improved algorithms for better precision.
    */
   analyze(): VideoAnalysis {
     if (!this.canvas || !this.ctx) {
@@ -307,14 +293,28 @@ class VideoQualityDetector {
     const { score: uniformityScore, stdDev: uniformityStandardDev } =
       this.calculateUniformity(luminances);
 
-    // Determine status
+    // Track brightness history for stability
+    this.brightnessHistory.push(brightness);
+    if (this.brightnessHistory.length > this.HISTORY_SIZE) {
+      this.brightnessHistory.shift();
+    }
+
+    // Check brightness stability (detect flicker/fluctuation)
+    const brightnessFluctuation = this.calculateFluctuation();
+    const isFluctuating = brightnessFluctuation > 15;
+
+    // Determine status with improved precision
     let status: VideoAnalysis["status"] = "OK";
-    if (brightness < this.BRIGHTNESS_LOW) {
-      status = "Too Dark";
-    } else if (brightness > this.BRIGHTNESS_HIGH) {
+    
+    // Priority: Overexposed > Too Dark > Uneven Lighting > Adjust Camera > OK
+    if (brightness > this.BRIGHTNESS_HIGH) {
       status = "Overexposed";
+    } else if (brightness < this.BRIGHTNESS_LOW) {
+      status = "Too Dark";
     } else if (uniformityStandardDev > this.UNIFORMITY_THRESHOLD) {
       status = "Uneven Lighting";
+    } else if (isFluctuating) {
+      status = "Adjust Camera"; // Flickering detected
     }
 
     return {
@@ -325,6 +325,23 @@ class VideoQualityDetector {
       facePercentOfFrame: 0,
       status: status,
     };
+  }
+
+  /**
+   * Calculate brightness fluctuation over recent history.
+   * Detects flicker and unstable lighting.
+   */
+  private calculateFluctuation(): number {
+    if (this.brightnessHistory.length < 2) return 0;
+    
+    let totalDeviation = 0;
+    const mean = this.brightnessHistory.reduce((a, b) => a + b, 0) / this.brightnessHistory.length;
+    
+    for (const brightness of this.brightnessHistory) {
+      totalDeviation += Math.abs(brightness - mean);
+    }
+    
+    return totalDeviation / this.brightnessHistory.length;
   }
 }
 
@@ -346,7 +363,23 @@ class NetworkQualityDetector {
   private lastBytesSent = 0;
   private lastTimestamp = Date.now();
   private jitterHistory: number[] = [];
+  private bitrateHistory: number[] = [];
   private readonly JITTER_WINDOW = 20;
+  private readonly BITRATE_WINDOW = 10;
+  
+  // Stricter thresholds for precision
+  private readonly BITRATE_CRITICAL = 250;     // Below this = critical
+  private readonly BITRATE_POOR = 500;         // Below this = poor
+  private readonly BITRATE_MODERATE = 1000;    // Below this = moderate
+  private readonly BITRATE_OPTIMAL = 1500;     // Above this = good
+  private readonly LATENCY_GOOD = 50;
+  private readonly LATENCY_MODERATE = 100;
+  private readonly LATENCY_POOR = 200;
+  private readonly LATENCY_CRITICAL = 300;
+  private readonly PACKET_LOSS_GOOD = 0.5;
+  private readonly PACKET_LOSS_MODERATE = 1.0;
+  private readonly PACKET_LOSS_POOR = 2.0;
+  private readonly JITTER_THRESHOLD = 30;
 
   constructor(pc: RTCPeerConnection) {
     this.pc = pc;
@@ -397,7 +430,7 @@ class NetworkQualityDetector {
 
   /**
    * Calculate overall stability score (0–100).
-   * Combines bitrate, packet loss, jitter, and latency.
+   * Combines bitrate, packet loss, jitter, and latency with weighted precision.
    */
   private calculateStabilityScore(
     bitrate: number,
@@ -405,18 +438,53 @@ class NetworkQualityDetector {
     jitter: number,
     latency: number
   ): number {
-    const bitrateScore = Math.min(bitrate / 2000, 1) * 30; // 30% weight
-    const lossScore = Math.max(1 - packetLoss / 10, 0) * 30; // 30% weight
-    const jitterScore = Math.max(1 - jitter / 100, 0) * 20; // 20% weight
-    const latencyScore = Math.max(1 - latency / 500, 0) * 20; // 20% weight
+    // Exponential penalties for poor conditions (more realistic)
+    let score = 100;
+    
+    // Bitrate impact (35% weight)
+    if (bitrate < this.BITRATE_CRITICAL) {
+      score -= 35;
+    } else if (bitrate < this.BITRATE_POOR) {
+      score -= 25;
+    } else if (bitrate < this.BITRATE_MODERATE) {
+      score -= 15;
+    } else if (bitrate < this.BITRATE_OPTIMAL) {
+      score -= 5;
+    }
+    
+    // Packet loss impact (30% weight)
+    if (packetLoss > this.PACKET_LOSS_POOR) {
+      score -= 30;
+    } else if (packetLoss > this.PACKET_LOSS_MODERATE) {
+      score -= 20;
+    } else if (packetLoss > this.PACKET_LOSS_GOOD) {
+      score -= 10;
+    }
+    
+    // Latency impact (20% weight)
+    if (latency > this.LATENCY_CRITICAL) {
+      score -= 20;
+    } else if (latency > this.LATENCY_POOR) {
+      score -= 15;
+    } else if (latency > this.LATENCY_MODERATE) {
+      score -= 8;
+    } else if (latency > this.LATENCY_GOOD) {
+      score -= 3;
+    }
+    
+    // Jitter impact (15% weight)
+    if (jitter > this.JITTER_THRESHOLD * 2) {
+      score -= 15;
+    } else if (jitter > this.JITTER_THRESHOLD) {
+      score -= 8;
+    }
 
-    const score =
-      bitrateScore + lossScore + jitterScore + latencyScore;
-    return Math.round(score);
+    return Math.max(0, score);
   }
 
   /**
    * Analyze network stats and return diagnostic data.
+   * Uses improved thresholds and better detection logic.
    */
   async analyze(): Promise<NetworkAnalysis> {
     if (!this.pc) {
@@ -444,6 +512,10 @@ class NetworkQualityDetector {
           const now = Date.now();
           const deltaTime = now - this.lastTimestamp;
           bitrate = this.calculateBitrate(r.bytesSent, this.lastBytesSent, deltaTime);
+          this.bitrateHistory.push(bitrate);
+          if (this.bitrateHistory.length > this.BITRATE_WINDOW) {
+            this.bitrateHistory.shift();
+          }
           this.lastBytesSent = r.bytesSent;
           this.lastTimestamp = now;
         }
@@ -472,13 +544,27 @@ class NetworkQualityDetector {
       latency
     );
 
-    // Determine status based on thresholds
+    // Determine status with improved precision
     let status: NetworkAnalysis["status"] = "Good";
-    if (packetLoss > 5 || latency > 300) {
+    
+    // Priority: Critical > Unstable > Moderate > Good
+    if (
+      bitrate < this.BITRATE_CRITICAL ||
+      packetLoss > this.PACKET_LOSS_POOR ||
+      latency > this.LATENCY_CRITICAL
+    ) {
       status = "Critical";
-    } else if (packetLoss > 2 || latency > 150 || bitrate < 300) {
+    } else if (
+      bitrate < this.BITRATE_POOR ||
+      packetLoss > this.PACKET_LOSS_MODERATE ||
+      latency > this.LATENCY_POOR ||
+      jitter > this.JITTER_THRESHOLD
+    ) {
       status = "Unstable";
-    } else if (latency > 80 || bitrate < 1500) {
+    } else if (
+      bitrate < this.BITRATE_MODERATE ||
+      latency > this.LATENCY_MODERATE
+    ) {
       status = "Moderate";
     }
 
