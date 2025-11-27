@@ -1,9 +1,11 @@
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect } from "react";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import { useToast } from "@/hooks/use-toast";
 import { VideoPreview } from "@/components/VideoPreview";
 import { QualityIndicator } from "@/components/QualityIndicator";
+import { QualityTips } from "@/components/QualityTips";
+import { ChatSimulation } from "@/components/ChatSimulation";
 import { useMediaStream } from "@/hooks/useMediaStream";
 import { useQualityChecks } from "@/hooks/useQualityChecks";
 import { Copy, Video, Mic, Wifi, Sun } from "lucide-react";
@@ -14,7 +16,7 @@ const CreatorTest = () => {
   const [isGenerating, setIsGenerating] = useState(false);
   
   const { stream, error: streamError, startStream } = useMediaStream();
-  const { audioLevel, lightingScore, networkQuality } = useQualityChecks(stream);
+  const { audioStatus, lightingStatus, networkStatus, metrics } = useQualityChecks(stream);
 
   useEffect(() => {
     startStream();
@@ -44,31 +46,19 @@ const CreatorTest = () => {
     });
   };
 
-  const getAudioStatus = () => {
-    if (audioLevel > 0.3) return { label: "Good", variant: "good" as const };
-    if (audioLevel > 0.1) return { label: "Low", variant: "warning" as const };
-    return { label: "Silent", variant: "error" as const };
+  const getStatusVariant = (status: string): "good" | "warning" | "error" => {
+    if (status === "OK" || status === "Good Lighting" || status === "Good") {
+      return "good";
+    }
+    if (status === "Too Quiet" || status === "Too Dark" || status === "Moderate" || status === "Uneven Lighting") {
+      return "warning";
+    }
+    return "error";
   };
 
-  const getLightingStatus = () => {
-    if (lightingScore > 120) return { label: "Good", variant: "good" as const };
-    if (lightingScore > 60) return { label: "Dim", variant: "warning" as const };
-    return { label: "Dark", variant: "error" as const };
-  };
-
-  const getNetworkStatus = () => {
-    if (networkQuality === "good") return { label: "Good", variant: "good" as const };
-    if (networkQuality === "fair") return { label: "Fair", variant: "warning" as const };
-    return { label: "Unstable", variant: "error" as const };
-  };
-
-  const audioStatus = getAudioStatus();
-  const lightingStatus = getLightingStatus();
-  const networkStatus = getNetworkStatus();
-
-  const allGood = audioStatus.variant === "good" && 
-                  lightingStatus.variant === "good" && 
-                  networkStatus.variant === "good";
+  const allGood = audioStatus === "OK" && 
+                  lightingStatus === "Good Lighting" && 
+                  networkStatus === "Good";
 
   return (
     <div className="min-h-screen bg-background p-6">
@@ -82,8 +72,14 @@ const CreatorTest = () => {
           <div className="lg:col-span-2 space-y-4">
             <VideoPreview stream={stream} error={streamError} />
             
+            <QualityTips 
+              audioStatus={audioStatus}
+              lightingStatus={lightingStatus}
+              networkStatus={networkStatus}
+            />
+            
             {allGood && (
-              <Card className="bg-card border-status-good/30 p-6 text-center">
+              <Card className="bg-card border-status-good/30 p-6 text-center animate-fade-in">
                 <p className="text-xl font-semibold text-status-good">
                   ✨ You're ready to go live!
                 </p>
@@ -101,26 +97,52 @@ const CreatorTest = () => {
               <div className="space-y-3">
                 <QualityIndicator
                   icon={<Mic className="w-4 h-4" />}
-                  label="Audio Level"
-                  status={audioStatus.label}
-                  variant={audioStatus.variant}
+                  label="Audio"
+                  status={audioStatus}
+                  variant={getStatusVariant(audioStatus)}
                 />
                 
                 <QualityIndicator
                   icon={<Sun className="w-4 h-4" />}
                   label="Lighting"
-                  status={lightingStatus.label}
-                  variant={lightingStatus.variant}
+                  status={lightingStatus}
+                  variant={getStatusVariant(lightingStatus)}
                 />
                 
                 <QualityIndicator
                   icon={<Wifi className="w-4 h-4" />}
                   label="Network"
-                  status={networkStatus.label}
-                  variant={networkStatus.variant}
+                  status={networkStatus}
+                  variant={getStatusVariant(networkStatus)}
                 />
               </div>
+              
+              {metrics && (
+                <div className="pt-3 border-t border-border space-y-2">
+                  <p className="text-xs text-muted-foreground">Technical Metrics</p>
+                  <div className="grid grid-cols-2 gap-2 text-[10px]">
+                    <div className="bg-secondary/50 rounded p-2">
+                      <p className="text-muted-foreground">Bitrate</p>
+                      <p className="font-mono text-foreground">{Math.round(metrics.networkBitrate)} kbps</p>
+                    </div>
+                    <div className="bg-secondary/50 rounded p-2">
+                      <p className="text-muted-foreground">Latency</p>
+                      <p className="font-mono text-foreground">{Math.round(metrics.latency)} ms</p>
+                    </div>
+                    <div className="bg-secondary/50 rounded p-2">
+                      <p className="text-muted-foreground">Audio</p>
+                      <p className="font-mono text-foreground">{Math.round(metrics.audioLevel * 100)}%</p>
+                    </div>
+                    <div className="bg-secondary/50 rounded p-2">
+                      <p className="text-muted-foreground">Light</p>
+                      <p className="font-mono text-foreground">{Math.round(metrics.lightingScore)}</p>
+                    </div>
+                  </div>
+                </div>
+              )}
             </Card>
+            
+            <ChatSimulation />
 
             <Card className="bg-card p-6 space-y-4">
               <h2 className="text-xl font-semibold text-foreground">
