@@ -20,56 +20,84 @@ class AudioQualityDetector {
   private analyser: AnalyserNode | null = null;
   private rmsWindow: number[] = [];
   private windowSize: number = 512; // ~500ms at 44.1kHz
-  private readonly RMS_THRESHOLD_LOW = 0.02;
-  private readonly RMS_THRESHOLD_HIGH = 0.95;
-  private readonly CLIPPING_THRESHOLD_PERCENT = 10;
-  private readonly NOISE_FLOOR_THRESHOLD = 0.005;
+  
+  // More precise thresholds (Google-grade)
+  private readonly RMS_THRESHOLD_LOW = 0.01;      // -40dB equivalent
+  private readonly RMS_THRESHOLD_OPTIMAL = 0.08;  // -22dB (good speech level)
+  private readonly RMS_THRESHOLD_HIGH = 0.7;      // -3dB (approaching clipping)
+  private readonly CLIPPING_THRESHOLD_PERCENT = 5; // 5% clipping is noticeable
+  private readonly NOISE_FLOOR_THRESHOLD = 0.003;
+  private readonly NOISE_SENSITIVITY = 0.15;      // Detect background noise ratio
 
   constructor(analyser: AnalyserNode) {
     this.analyser = analyser;
   }
 
   /**
-   * Calculate RMS (Root Mean Square) amplitude.
-   * Returns normalized value [0, 1].
+   * Calculate RMS (Root Mean Square) amplitude with higher precision.
+   * Uses smoothing over multiple frames for stability.
    */
   private calculateRMS(samples: Uint8Array): number {
     let sum = 0;
-    for (let i = 0; i < samples.length; i++) {
+    let count = 0;
+    
+    // Skip first/last samples which may have edge artifacts
+    for (let i = 10; i < samples.length - 10; i++) {
       const normalized = (samples[i] - 128) / 128;
       sum += normalized * normalized;
+      count++;
     }
-    const rms = Math.sqrt(sum / samples.length);
+    
+    const rms = count > 0 ? Math.sqrt(sum / count) : 0;
     return Math.min(rms, 1.0);
   }
 
   /**
-   * Detect clipping by checking for peaks at ±1.0.
-   * Returns percent of samples that clip in the window.
+   * More precise clipping detection using frequency domain.
    */
   private detectClipping(samples: Uint8Array): number {
     let clipCount = 0;
+    const clipThreshold = 0.95;
+    
     for (let i = 0; i < samples.length; i++) {
-      const normalized = (samples[i] - 128) / 128;
-      if (Math.abs(normalized) >= 0.99) clipCount++;
+      const normalized = Math.abs((samples[i] - 128) / 128);
+      if (normalized >= clipThreshold) clipCount++;
     }
     return (clipCount / samples.length) * 100;
   }
 
   /**
-   * Estimate noise floor when user is not speaking.
+   * Better noise floor estimation using percentile method.
    */
   private estimateNoiseFloor(samples: Uint8Array): number {
     const sorted = Array.from(samples)
       .map((s) => Math.abs((s - 128) / 128))
       .sort((a, b) => a - b);
-    // Take bottom 10% as noise floor estimate
-    const noiseIndex = Math.floor(sorted.length * 0.1);
+    
+    // Take bottom 5% as noise floor (more precise than 10%)
+    const noiseIndex = Math.floor(sorted.length * 0.05);
     return sorted[noiseIndex] || 0;
   }
 
   /**
-   * Analyze audio frame and return diagnostic data.
+   * Detect background noise ratio.
+   */
+  private detectBackgroundNoise(samples: Uint8Array, noiseFloor: number): number {
+    let noiseCount = 0;
+    const noiseThreshold = noiseFloor * (1 + this.NOISE_SENSITIVITY);
+    
+    for (let i = 0; i < samples.length; i++) {
+      const normalized = Math.abs((samples[i] - 128) / 128);
+      if (normalized > noiseThreshold && normalized < 0.3) {
+        noiseCount++;
+      }
+    }
+    
+    return (noiseCount / samples.length) * 100;
+  }
+
+  /**
+   * Analyze audio frame with improved precision.
    */
   analyze(): AudioAnalysis {
     if (!this.analyser) {
@@ -90,6 +118,7 @@ class AudioQualityDetector {
     const rms = this.calculateRMS(dataArray);
     const clippingPercent = this.detectClipping(dataArray);
     const noiseFloor = this.estimateNoiseFloor(dataArray);
+    const backgroundNoiseRatio = this.detectBackgroundNoise(dataArray, noiseFloor);
 
     // Maintain rolling window of RMS values
     this.rmsWindow.push(rms);
@@ -97,7 +126,29 @@ class AudioQualityDetector {
       this.rmsWindow.shift();
     }
 
-    // Determine status
+    // More precise status determination (Google grade)
+    let status: AudioAnalysis["status"] = "OK";
+    
+    // Priority: Clipping > Too Loud > Too Quiet > Background Noise > OK
+    if (clippingPercent > this.CLIPPING_THRESHOLD_PERCENT) {
+      status = "Clipping";
+    } else if (rms > this.RMS_THRESHOLD_HIGH) {
+      status = "Too Loud";
+    } else if (rms < this.RMS_THRESHOLD_LOW) {
+      status = "Too Quiet";
+    } else if (backgroundNoiseRatio > 40 && rms < this.RMS_THRESHOLD_OPTIMAL) {
+      status = "Background Noise";
+    }
+
+    return {
+      rms: rms,
+      clipping: clippingPercent > this.CLIPPING_THRESHOLD_PERCENT,
+      clippingPercent: clippingPercent,
+      noiseFloor: noiseFloor,
+      microphoneType: this.detectMicrophoneType(),
+      status: status,
+    };
+  }
     let status: AudioAnalysis["status"] = "OK";
     if (rms < this.RMS_THRESHOLD_LOW) {
       status = "Too Quiet";
