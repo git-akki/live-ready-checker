@@ -1,0 +1,156 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Design System - Modern AI-Inspired Minimal Theme */
+
+@layer base {
+  :root {
+    /* Dark theme base */
+    --background: 240 10% 6%;
+    --foreground: 0 0% 98%;
+
+    --card: 240 8% 11%;
+    --card-foreground: 0 0% 98%;
+
+    --popover: 240 8% 11%;
+    --popover-foreground: 0 0% 98%;
+
+    /* White primary accent */
+    --primary: 0 0% 100%;
+    --primary-foreground: 240 10% 6%;
+
+    --secondary: 240 6% 18%;
+    --secondary-foreground: 0 0% 98%;
+
+    --muted: 240 6% 18%;
+    --muted-foreground: 240 5% 60%;
+
+    --accent: 0 0% 100%;
+    --accent-foreground: 240 10% 6%;
+
+    --destructive: 0 100% 50%;
+    --destructive-foreground: 0 0% 100%;
+
+    --border: 240 6% 18%;
+    --input: 240 6% 18%;
+    --ring: 0 0% 100%;
+
+    --radius: 0.75rem;
+
+    /* ChatGPT-inspired status colors */
+    --status-good: 34 99% 55%;        /* Green */
+    --status-warning: 0 0% 98%;       /* White */
+    --status-error: 0 100% 50%;       /* Red */
+    
+    --glow-primary: 0 0% 100%;
+    --transition-smooth: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+
+  html {
+    @apply scroll-smooth;
+  }
+
+  body {
+    @apply bg-background text-foreground;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  }
+
+  h1, h2, h3, h4, h5, h6 {
+    @apply font-semibold tracking-tight;
+  }
+}
+
+@layer components {
+  /* Glass morphism effect */
+  .glass {
+    background: rgba(var(--card), 0.7);
+    backdrop-filter: blur(8px);
+    -webkit-backdrop-filter: blur(8px);
+    border: 1px solid rgba(255, 255, 255, 0.05);
+  }
+
+  /* Subtle glow for elevated elements */
+  .ai-glow {
+    box-shadow: 0 8px 32px rgba(255, 255, 255, 0.08), inset 0 1px 0 rgba(255, 255, 255, 0.04);
+  }
+
+  /* Minimal button style */
+  .btn-minimal {
+    @apply rounded-lg px-3 py-2 text-sm font-semibold tracking-tight transition-colors;
+  }
+
+  /* Subtle pulse animation for status indicators */
+  .status-pulse {
+    animation: pulse-glow 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+  }
+
+  @keyframes pulse-glow {
+    0%, 100% {
+      opacity: 1;
+      box-shadow: 0 0 0 0 rgba(255, 255, 255, 0.2);
+    }
+    50% {
+      opacity: 0.9;
+      box-shadow: 0 0 0 6px rgba(255, 255, 255, 0.08);
+    }
+  }
+
+  /* Smooth fade-in entrance */
+  @keyframes fade-in {
+    from {
+      opacity: 0;
+      transform: translateY(8px);
+    }
+    to {
+      opacity: 1;
+      transform: translateY(0);
+    }
+  }
+
+  .animate-fade-in {
+    animation: fade-in 0.4s cubic-bezier(0.23, 1, 0.320, 1);
+  }
+
+  /* Smooth slide-in from left */
+  @keyframes slide-in-left {
+    from {
+      opacity: 0;
+      transform: translateX(-16px);
+    }
+    to {
+      opacity: 1;
+      transform: translateX(0);
+    }
+  }
+
+  .animate-slide-in-left {
+    animation: slide-in-left 0.4s cubic-bezier(0.23, 1, 0.320, 1);
+  }
+
+  /* Card base styles */
+  .card-base {
+    @apply rounded-2xl border border-[rgba(255,255,255,0.05)] bg-[rgba(var(--card),0.5)] backdrop-blur-md p-6 transition-all;
+  }
+
+  /* Status badge base */
+  .status-badge {
+    @apply px-3 py-1 rounded-full text-xs font-semibold border transition-all;
+  }
+
+  /* Grid metrics container */
+  .metrics-grid {
+    @apply space-y-2 bg-[rgba(var(--secondary),0.03)] p-3 rounded-lg;
+  }
+
+  /* Metric item */
+  .metric-item {
+    @apply flex justify-between items-center py-1 text-xs;
+  }
+}

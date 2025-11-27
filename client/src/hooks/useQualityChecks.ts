@@ -207,88 +207,106 @@ export const useQualityChecks = (stream: MediaStream | null) => {
     };
   }, [stream]);
 
-  // Network quality estimation using WebRTC loopback
+  // Network quality estimation using a proper WebRTC loopback (two RTCPeerConnections)
   useEffect(() => {
-    let peerConnection: RTCPeerConnection | null = null;
+    let pc1: RTCPeerConnection | null = null;
+    let pc2: RTCPeerConnection | null = null;
     let statsInterval: NodeJS.Timeout | null = null;
 
     const setupNetworkCheck = async () => {
       try {
-        peerConnection = new RTCPeerConnection({
-          iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
-        });
+        pc1 = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
+        pc2 = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
 
-        // Create a loopback connection for stats
+        // Candidate exchange
+        pc1.onicecandidate = (e) => {
+          if (e.candidate && pc2) pc2.addIceCandidate(e.candidate).catch(() => {});
+        };
+        pc2.onicecandidate = (e) => {
+          if (e.candidate && pc1) pc1.addIceCandidate(e.candidate).catch(() => {});
+        };
+
+        // Add local tracks to pc1
         if (stream) {
-          stream.getTracks().forEach(track => {
-            peerConnection?.addTrack(track, stream);
+          stream.getTracks().forEach((track) => {
+            pc1?.addTrack(track, stream as MediaStream);
           });
         }
 
-        // Create offer and set local description
-        const offer = await peerConnection.createOffer();
-        await peerConnection.setLocalDescription(offer);
+        // When pc2 gets a track, attach to a dummy element (not strictly necessary)
+        pc2.ontrack = () => {
+          // noop - we only care about stats
+        };
 
-        // Monitor stats
+        // Create SDP offer/answer to establish connection
+        const offer = await pc1.createOffer();
+        await pc1.setLocalDescription(offer);
+
+        await pc2.setRemoteDescription(offer);
+        const answer = await pc2.createAnswer();
+        await pc2.setLocalDescription(answer);
+        await pc1.setRemoteDescription(answer);
+
+        // Monitor stats periodically
+        let lastBytesSent = 0;
+        let lastTimestamp = Date.now();
+
         statsInterval = setInterval(async () => {
-          if (!peerConnection) return;
+          if (!pc1) return;
 
-          const stats = await peerConnection.getStats();
+          const stats = await pc1.getStats();
           let totalBitrate = 0;
           let totalPacketLoss = 0;
-          let totalLatency = 0;
-          let statCount = 0;
+          let currentRtt = 0;
 
           stats.forEach((report) => {
-            if (report.type === 'outbound-rtp') {
-              // Estimate bitrate from bytes sent
-              if (report.bytesSent) {
-                totalBitrate += (report.bytesSent * 8) / 1000; // Convert to kbps
+            if (report.type === 'outbound-rtp' && report.bytesSent !== undefined && report.timestamp !== undefined) {
+              const bytes = (report as any).bytesSent as number;
+              const now = (report as any).timestamp as number;
+              const deltaBytes = bytes - lastBytesSent;
+              const deltaTime = (Date.now() - lastTimestamp) / 1000;
+              if (deltaTime > 0) {
+                totalBitrate += (deltaBytes * 8) / deltaTime / 1000; // kbps
               }
-              
-              // Packet loss
-              if (report.packetsLost !== undefined) {
-                totalPacketLoss += report.packetsLost;
-              }
-              
-              statCount++;
+              lastBytesSent = bytes;
+              lastTimestamp = Date.now();
             }
-            
-            if (report.type === 'candidate-pair' && report.currentRoundTripTime) {
-              totalLatency += report.currentRoundTripTime * 1000; // Convert to ms
+
+            if (report.type === 'outbound-rtp' && (report as any).packetsLost !== undefined) {
+              totalPacketLoss += (report as any).packetsLost as number;
+            }
+
+            if (report.type === 'candidate-pair' && (report as any).currentRoundTripTime) {
+              currentRtt = (report as any).currentRoundTripTime * 1000; // ms
             }
           });
 
-          // Update metrics
           setNetworkBitrate(totalBitrate);
           setPacketLoss(totalPacketLoss);
-          setLatency(totalLatency);
+          setLatency(currentRtt);
 
-          // Determine network status
-          if (totalPacketLoss > 10 || totalLatency > 300) {
-            setNetworkStatus("Critical");
-          } else if (totalPacketLoss > 5 || totalLatency > 150 || totalBitrate < 500) {
-            setNetworkStatus("Unstable");
-          } else if (totalLatency > 80 || totalBitrate < 1000) {
-            setNetworkStatus("Moderate");
+          if (totalPacketLoss > 10 || currentRtt > 300) {
+            setNetworkStatus('Critical');
+          } else if (totalPacketLoss > 5 || currentRtt > 150 || totalBitrate < 500) {
+            setNetworkStatus('Unstable');
+          } else if (currentRtt > 80 || totalBitrate < 1000) {
+            setNetworkStatus('Moderate');
           } else {
-            setNetworkStatus("Good");
+            setNetworkStatus('Good');
           }
         }, 2000);
-
       } catch (error) {
-        console.error("Network check setup failed:", error);
-        setNetworkStatus("Moderate");
+        console.error('Network check setup failed:', error);
+        setNetworkStatus('Moderate');
       }
     };
 
-    if (stream) {
-      setupNetworkCheck();
-    }
+    if (stream) setupNetworkCheck();
 
     return () => {
       if (statsInterval) clearInterval(statsInterval);
-      if (peerConnection) peerConnection.close();
+      if (pc1) pc1.close();
+      if (pc2) pc2.close();
     };
   }, [stream]);
 
