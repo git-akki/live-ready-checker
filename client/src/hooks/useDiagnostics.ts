@@ -5,6 +5,7 @@ import {
   NetworkQualityDetector,
   DiagnosticData,
   calculateOverallStatus,
+  calculateQualityScore,
 } from "@/lib/qualityDetection";
 
 /**
@@ -158,14 +159,24 @@ export const useQualityDiagnostics = (
           packetLoss: 0,
           jitter: 0,
           latency: 0,
+          framesPerSecond: 0,
+          frameDropRatio: 0,
+          bitrateStability: 0,
+          lossStability: 0,
+          jitterStability: 0,
+          rttStability: 0,
           stabilityScore: 0,
           status: "Good" as const,
         });
+
+        // Calculate quality scores
+        const qualityScore = calculateQualityScore({ audio, video, network });
 
         const diagnostic: DiagnosticData = {
           audio,
           video,
           network,
+          qualityScore,
           timestamp: Date.now(),
           overallStatus: calculateOverallStatus({ audio, video, network }),
         };

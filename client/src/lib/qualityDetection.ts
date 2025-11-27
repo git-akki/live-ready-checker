@@ -354,7 +354,13 @@ interface NetworkAnalysis {
   packetLoss: number; // percent
   jitter: number; // ms
   latency: number; // ms
-  stabilityScore: number; // 0–100
+  framesPerSecond: number;
+  frameDropRatio: number; // 0-1
+  bitrateStability: number; // standard deviation
+  lossStability: number; // trend indicator
+  jitterStability: number; // standard deviation
+  rttStability: number; // variance
+  stabilityScore: number; // 0–100 (weighted composite)
   status: "Good" | "Moderate" | "Unstable" | "Critical";
 }
 
@@ -362,16 +368,23 @@ class NetworkQualityDetector {
   private pc: RTCPeerConnection | null = null;
   private lastBytesSent = 0;
   private lastTimestamp = Date.now();
-  private jitterHistory: number[] = [];
+  
+  // Rolling windows (10 samples = ~5 seconds at 500ms intervals)
   private bitrateHistory: number[] = [];
-  private readonly JITTER_WINDOW = 20;
-  private readonly BITRATE_WINDOW = 10;
+  private latencyHistory: number[] = [];
+  private jitterHistory: number[] = [];
+  private packetLossHistory: number[] = [];
+  private fpsHistory: number[] = [];
+  private frameDropHistory: number[] = [];
+  
+  private readonly HISTORY_WINDOW = 10;
+  private readonly STAT_COLLECTION_INTERVAL = 500; // ms
   
   // Stricter thresholds for precision
-  private readonly BITRATE_CRITICAL = 250;     // Below this = critical
-  private readonly BITRATE_POOR = 500;         // Below this = poor
-  private readonly BITRATE_MODERATE = 1000;    // Below this = moderate
-  private readonly BITRATE_OPTIMAL = 1500;     // Above this = good
+  private readonly BITRATE_CRITICAL = 250;
+  private readonly BITRATE_POOR = 500;
+  private readonly BITRATE_MODERATE = 1000;
+  private readonly BITRATE_OPTIMAL = 1500;
   private readonly LATENCY_GOOD = 50;
   private readonly LATENCY_MODERATE = 100;
   private readonly LATENCY_POOR = 200;
@@ -380,6 +393,14 @@ class NetworkQualityDetector {
   private readonly PACKET_LOSS_MODERATE = 1.0;
   private readonly PACKET_LOSS_POOR = 2.0;
   private readonly JITTER_THRESHOLD = 30;
+  private readonly MIN_FPS_VIABLE = 20;
+  private readonly MAX_FRAME_DROP_RATIO = 0.1;
+  
+  // Weighted stability score coefficients
+  private readonly BITRATE_STABILITY_WEIGHT = 0.35;
+  private readonly LOSS_STABILITY_WEIGHT = 0.30;
+  private readonly JITTER_STABILITY_WEIGHT = 0.20;
+  private readonly RTT_STABILITY_WEIGHT = 0.15;
 
   constructor(pc: RTCPeerConnection) {
     this.pc = pc;
@@ -400,91 +421,126 @@ class NetworkQualityDetector {
   }
 
   /**
-   * Calculate packet loss percentage.
+   * Calculate standard deviation of an array.
    */
-  private calculatePacketLoss(
-    packetsLost: number,
-    packetsSent: number
-  ): number {
-    if (packetsSent === 0) return 0;
-    return (packetsLost / packetsSent) * 100;
+  private calculateStdDev(values: number[]): number {
+    if (values.length < 2) return 0;
+    const mean = values.reduce((a, b) => a + b, 0) / values.length;
+    const variance =
+      values.reduce((sum, val) => sum + (val - mean) ** 2, 0) / values.length;
+    return Math.sqrt(variance);
   }
 
   /**
-   * Track jitter and return smoothed value.
+   * Calculate median of an array.
    */
-  private calculateJitter(rtt: number): number {
-    this.jitterHistory.push(rtt);
-    if (this.jitterHistory.length > this.JITTER_WINDOW) {
-      this.jitterHistory.shift();
-    }
-
-    if (this.jitterHistory.length < 2) return 0;
-
-    let jitter = 0;
-    for (let i = 1; i < this.jitterHistory.length; i++) {
-      jitter += Math.abs(this.jitterHistory[i] - this.jitterHistory[i - 1]);
-    }
-    return jitter / (this.jitterHistory.length - 1);
+  private calculateMedian(values: number[]): number {
+    if (values.length === 0) return 0;
+    const sorted = [...values].sort((a, b) => a - b);
+    const mid = Math.floor(sorted.length / 2);
+    return sorted.length % 2 !== 0 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
   }
 
   /**
-   * Calculate overall stability score (0–100).
-   * Combines bitrate, packet loss, jitter, and latency with weighted precision.
+   * Calculate trend of packet loss (increasing = unstable).
+   */
+  private calculateLossTrend(): number {
+    if (this.packetLossHistory.length < 3) return 0;
+    const recent = this.packetLossHistory.slice(-3);
+    const trend = (recent[2] - recent[0]) / 2; // Slope over 3 samples
+    return Math.max(0, trend); // Positive trend = increasing loss
+  }
+
+  /**
+   * Extract bitrate stability from history.
+   */
+  private getBitrateStability(): number {
+    return this.calculateStdDev(this.bitrateHistory);
+  }
+
+  /**
+   * Extract loss stability from trend.
+   */
+  private getLossStability(): number {
+    return this.calculateLossTrend();
+  }
+
+  /**
+   * Extract jitter stability from latency variance.
+   */
+  private getJitterStability(): number {
+    return this.calculateStdDev(this.latencyHistory);
+  }
+
+  /**
+   * Extract RTT stability from variance.
+   */
+  private getRttStability(): number {
+    if (this.latencyHistory.length < 2) return 0;
+    const mean = this.latencyHistory.reduce((a, b) => a + b, 0) / this.latencyHistory.length;
+    const variance =
+      this.latencyHistory.reduce((sum, val) => sum + (val - mean) ** 2, 0) /
+      this.latencyHistory.length;
+    return Math.sqrt(variance);
+  }
+
+  /**
+   * Calculate weighted stability score (0–100).
+   * Reflects actual livestream network conditions.
    */
   private calculateStabilityScore(
-    bitrate: number,
-    packetLoss: number,
-    jitter: number,
-    latency: number
+    currentBitrate: number,
+    currentPacketLoss: number,
+    currentLatency: number,
+    fps: number,
+    frameDropRatio: number
   ): number {
-    // Exponential penalties for poor conditions (more realistic)
-    let score = 100;
+    // Normalize metrics to 0-1 scale
+    const bitrateNorm = Math.min(currentBitrate / this.BITRATE_OPTIMAL, 1);
+    const lossNorm = Math.max(1 - (currentPacketLoss / 5), 0); // 5% = 0 score
+    const latencyNorm = Math.max(1 - (currentLatency / 500), 0); // 500ms = 0 score
+    const fpsNorm = Math.min(fps / 30, 1); // 30 FPS = max score
+    const dropNorm = Math.max(1 - (frameDropRatio / 0.2), 0); // 20% drop = 0 score
+
+    // Get stability metrics from history
+    const bitrateStability = this.getBitrateStability();
+    const lossStability = this.getLossStability();
+    const jitterStability = this.getJitterStability();
+    const rttStability = this.getRttStability();
+
+    // Normalize stability to 0-1 (lower stddev = higher score)
+    const bitrateStabilityNorm = Math.max(1 - (bitrateStability / 500), 0);
+    const lossStabilityNorm = Math.max(1 - (lossStability / 2), 0);
+    const jitterStabilityNorm = Math.max(1 - (jitterStability / 100), 0);
+    const rttStabilityNorm = Math.max(1 - (rttStability / 200), 0);
+
+    // Weighted composite score
+    const stabilityComponent =
+      this.BITRATE_STABILITY_WEIGHT * bitrateStabilityNorm +
+      this.LOSS_STABILITY_WEIGHT * lossStabilityNorm +
+      this.JITTER_STABILITY_WEIGHT * jitterStabilityNorm +
+      this.RTT_STABILITY_WEIGHT * rttStabilityNorm;
+
+    // Overall score combines current metrics (40%) and stability (60%)
+    const currentMetricsScore =
+      0.25 * bitrateNorm +
+      0.25 * lossNorm +
+      0.25 * latencyNorm +
+      0.25 * fpsNorm;
+
+    const finalScore = (currentMetricsScore * 0.4 + stabilityComponent * 0.6) * 100;
     
-    // Bitrate impact (35% weight)
-    if (bitrate < this.BITRATE_CRITICAL) {
-      score -= 35;
-    } else if (bitrate < this.BITRATE_POOR) {
-      score -= 25;
-    } else if (bitrate < this.BITRATE_MODERATE) {
-      score -= 15;
-    } else if (bitrate < this.BITRATE_OPTIMAL) {
-      score -= 5;
-    }
-    
-    // Packet loss impact (30% weight)
-    if (packetLoss > this.PACKET_LOSS_POOR) {
-      score -= 30;
-    } else if (packetLoss > this.PACKET_LOSS_MODERATE) {
-      score -= 20;
-    } else if (packetLoss > this.PACKET_LOSS_GOOD) {
-      score -= 10;
-    }
-    
-    // Latency impact (20% weight)
-    if (latency > this.LATENCY_CRITICAL) {
-      score -= 20;
-    } else if (latency > this.LATENCY_POOR) {
-      score -= 15;
-    } else if (latency > this.LATENCY_MODERATE) {
-      score -= 8;
-    } else if (latency > this.LATENCY_GOOD) {
-      score -= 3;
-    }
-    
-    // Jitter impact (15% weight)
-    if (jitter > this.JITTER_THRESHOLD * 2) {
-      score -= 15;
-    } else if (jitter > this.JITTER_THRESHOLD) {
-      score -= 8;
+    // Penalize heavy frame drops
+    if (frameDropRatio > this.MAX_FRAME_DROP_RATIO) {
+      return Math.max(0, finalScore - (frameDropRatio - this.MAX_FRAME_DROP_RATIO) * 100);
     }
 
-    return Math.max(0, score);
+    return Math.round(Math.max(0, Math.min(100, finalScore)));
   }
 
   /**
    * Analyze network stats and return diagnostic data.
-   * Uses improved thresholds and better detection logic.
+   * Collects comprehensive network metrics every 500ms.
    */
   async analyze(): Promise<NetworkAnalysis> {
     if (!this.pc) {
@@ -493,6 +549,12 @@ class NetworkQualityDetector {
         packetLoss: 0,
         jitter: 0,
         latency: 0,
+        framesPerSecond: 0,
+        frameDropRatio: 0,
+        bitrateStability: 0,
+        lossStability: 0,
+        jitterStability: 0,
+        rttStability: 0,
         stabilityScore: 0,
         status: "Good",
       };
@@ -504,20 +566,26 @@ class NetworkQualityDetector {
     let latency = 0;
     let packetsSent = 0;
     let packetsLost = 0;
+    let framesPerSecond = 0;
+    let framesDropped = 0;
+    let totalFrames = 0;
 
     stats.forEach((report) => {
-      if (report.type === "outbound-rtp") {
+      if (report.type === "outbound-rtp" && report.kind === "video") {
         const r = report as any;
         if (r.bytesSent !== undefined) {
           const now = Date.now();
           const deltaTime = now - this.lastTimestamp;
-          bitrate = this.calculateBitrate(r.bytesSent, this.lastBytesSent, deltaTime);
-          this.bitrateHistory.push(bitrate);
-          if (this.bitrateHistory.length > this.BITRATE_WINDOW) {
-            this.bitrateHistory.shift();
+          
+          if (deltaTime > 0) {
+            bitrate = this.calculateBitrate(r.bytesSent, this.lastBytesSent, deltaTime);
+            this.bitrateHistory.push(bitrate);
+            if (this.bitrateHistory.length > this.HISTORY_WINDOW) {
+              this.bitrateHistory.shift();
+            }
+            this.lastBytesSent = r.bytesSent;
+            this.lastTimestamp = now;
           }
-          this.lastBytesSent = r.bytesSent;
-          this.lastTimestamp = now;
         }
         if (r.packetsLost !== undefined) {
           packetsLost = r.packetsLost;
@@ -525,46 +593,91 @@ class NetworkQualityDetector {
         if (r.packetsSent !== undefined) {
           packetsSent = r.packetsSent;
         }
+        if (r.framesPerSecond !== undefined) {
+          framesPerSecond = r.framesPerSecond;
+          this.fpsHistory.push(framesPerSecond);
+          if (this.fpsHistory.length > this.HISTORY_WINDOW) {
+            this.fpsHistory.shift();
+          }
+        }
+        if (r.framesDropped !== undefined && r.framesSent !== undefined) {
+          framesDropped = r.framesDropped;
+          totalFrames = r.framesSent + framesDropped;
+        }
       }
 
       if (report.type === "candidate-pair") {
         const r = report as any;
         if (r.currentRoundTripTime !== undefined) {
           latency = r.currentRoundTripTime * 1000; // Convert to ms
+          this.latencyHistory.push(latency);
+          if (this.latencyHistory.length > this.HISTORY_WINDOW) {
+            this.latencyHistory.shift();
+          }
         }
       }
     });
 
-    packetLoss = this.calculatePacketLoss(packetsLost, packetsSent);
-    const jitter = this.calculateJitter(latency);
+    // Calculate packet loss percentage
+    packetLoss = packetsSent > 0 ? (packetsLost / packetsSent) * 100 : 0;
+    this.packetLossHistory.push(packetLoss);
+    if (this.packetLossHistory.length > this.HISTORY_WINDOW) {
+      this.packetLossHistory.shift();
+    }
+
+    // Calculate frame drop ratio
+    const frameDropRatio = totalFrames > 0 ? framesDropped / totalFrames : 0;
+    this.frameDropHistory.push(frameDropRatio);
+    if (this.frameDropHistory.length > this.HISTORY_WINDOW) {
+      this.frameDropHistory.shift();
+    }
+
+    // Calculate jitter (variance in RTT)
+    const jitter = this.calculateStdDev(this.latencyHistory);
+
+    // Get stability metrics
+    const bitrateStability = this.getBitrateStability();
+    const lossStability = this.getLossStability();
+    const jitterStability = this.getJitterStability();
+    const rttStability = this.getRttStability();
+
+    // Calculate overall stability score
     const stabilityScore = this.calculateStabilityScore(
       bitrate,
       packetLoss,
-      jitter,
-      latency
+      latency,
+      framesPerSecond,
+      frameDropRatio
     );
 
-    // Determine status with improved precision
+    // Determine status with comprehensive checks
     let status: NetworkAnalysis["status"] = "Good";
-    
-    // Priority: Critical > Unstable > Moderate > Good
-    if (
+
+    const isCritical =
       bitrate < this.BITRATE_CRITICAL ||
       packetLoss > this.PACKET_LOSS_POOR ||
-      latency > this.LATENCY_CRITICAL
-    ) {
-      status = "Critical";
-    } else if (
+      latency > this.LATENCY_CRITICAL ||
+      framesPerSecond < this.MIN_FPS_VIABLE ||
+      frameDropRatio > this.MAX_FRAME_DROP_RATIO;
+
+    const isUnstable =
       bitrate < this.BITRATE_POOR ||
       packetLoss > this.PACKET_LOSS_MODERATE ||
       latency > this.LATENCY_POOR ||
-      jitter > this.JITTER_THRESHOLD
-    ) {
-      status = "Unstable";
-    } else if (
+      jitter > this.JITTER_THRESHOLD ||
+      bitrateStability > 200 ||
+      lossStability > 1.0;
+
+    const isModerate =
       bitrate < this.BITRATE_MODERATE ||
-      latency > this.LATENCY_MODERATE
-    ) {
+      latency > this.LATENCY_MODERATE ||
+      framesPerSecond < 24;
+
+    if (isCritical) {
+      status = "Critical";
+    } else if (isUnstable) {
+      status = "Unstable";
+    } else if (isModerate) {
       status = "Moderate";
     }
 
@@ -573,6 +686,12 @@ class NetworkQualityDetector {
       packetLoss: Math.round(packetLoss * 100) / 100,
       jitter: Math.round(jitter),
       latency: Math.round(latency),
+      framesPerSecond: Math.round(framesPerSecond),
+      frameDropRatio: Math.round(frameDropRatio * 1000) / 1000,
+      bitrateStability: Math.round(bitrateStability),
+      lossStability: Math.round(lossStability * 1000) / 1000,
+      jitterStability: Math.round(jitterStability),
+      rttStability: Math.round(rttStability),
       stabilityScore: stabilityScore,
       status: status,
     };
@@ -580,21 +699,103 @@ class NetworkQualityDetector {
 }
 
 // ============================================================================
-// Unified Diagnostic Model
+// Unified Diagnostic Model with Weighted Quality Scoring
 // ============================================================================
+
+export interface QualityScore {
+  audioScore: number; // 0-100
+  videoScore: number; // 0-100
+  networkScore: number; // 0-100
+  overallQuality: number; // 0-100 (weighted: 40% video + 40% audio + 20% network)
+}
 
 export interface DiagnosticData {
   audio: AudioAnalysis;
   video: VideoAnalysis;
   network: NetworkAnalysis;
+  qualityScore: QualityScore;
   timestamp: number;
   overallStatus: "Good" | "Moderate" | "Poor" | "Critical";
 }
 
 /**
+ * Convert audio status to quality score (0-100).
+ */
+function audioStatusToScore(status: string, rms: number, clipping: boolean): number {
+  if (status === "OK") {
+    // Bonus for stability in optimal range
+    const optimalRange = Math.abs(rms - 0.08);
+    return Math.max(85, 100 - optimalRange * 500);
+  } else if (status === "Background Noise") {
+    return 70;
+  } else if (status === "Too Quiet") {
+    return 50;
+  } else if (status === "Too Loud") {
+    return 40;
+  } else if (status === "Clipping") {
+    return 0;
+  }
+  return 75;
+}
+
+/**
+ * Convert video status to quality score (0-100).
+ */
+function videoStatusToScore(status: string, brightness: number, uniformityScore: number): number {
+  if (status === "OK") {
+    // Bonus for good uniformity
+    return Math.round(85 + uniformityScore * 15);
+  } else if (status === "Adjust Camera") {
+    return 70;
+  } else if (status === "Too Dark") {
+    return 50;
+  } else if (status === "Uneven Lighting") {
+    return 60;
+  } else if (status === "Overexposed") {
+    return 40;
+  }
+  return 75;
+}
+
+/**
+ * Calculate overall quality score from individual metrics.
+ * Weighting: 40% video + 40% audio + 20% network
+ */
+export function calculateQualityScore(diagnostic: Omit<DiagnosticData, 'qualityScore' | 'timestamp' | 'overallStatus'>): QualityScore {
+  // Audio score
+  const audioScore = audioStatusToScore(
+    diagnostic.audio.status,
+    diagnostic.audio.rms,
+    diagnostic.audio.clipping
+  );
+
+  // Video score
+  const videoScore = videoStatusToScore(
+    diagnostic.video.status,
+    diagnostic.video.brightness,
+    diagnostic.video.uniformityScore
+  );
+
+  // Network score (use stabilityScore directly)
+  const networkScore = diagnostic.network.stabilityScore;
+
+  // Weighted overall quality
+  const overallQuality = Math.round(
+    videoScore * 0.4 + audioScore * 0.4 + networkScore * 0.2
+  );
+
+  return {
+    audioScore: Math.round(audioScore),
+    videoScore: Math.round(videoScore),
+    networkScore: Math.round(networkScore),
+    overallQuality: Math.max(0, Math.min(100, overallQuality)),
+  };
+}
+
+/**
  * Calculate overall status from individual diagnostics.
  */
-export function calculateOverallStatus(diagnostic: Omit<DiagnosticData, 'timestamp' | 'overallStatus'>): DiagnosticData['overallStatus'] {
+export function calculateOverallStatus(diagnostic: Omit<DiagnosticData, 'qualityScore' | 'timestamp' | 'overallStatus'>): DiagnosticData['overallStatus'] {
   const criticalStatuses = ["Too Loud", "Too Dark", "Critical"];
   const poorStatuses = ["Too Quiet", "Overexposed", "Clipping", "Unstable"];
 
